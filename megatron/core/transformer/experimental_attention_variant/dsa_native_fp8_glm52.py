@@ -8,7 +8,7 @@ these operations, which changes scores near the top-k boundary.
 
 This adapter reproduces the GLM-5.2 preprocessing order and returns FP32 Q, K,
 and raw head-weight carrier tensors. The model-independent scorer in
-``megatron.core.transformer.experimental_attention_variant.dsa_sm90_native_fp8``
+``megatron.core.transformer.experimental_attention_variant.dsa_native_fp8_scorer``
 owns final E4M3/UE8M0 quantization, scale folding, cuDNN dispatch, and MCore
 compatibility routing.
 """
@@ -27,7 +27,7 @@ from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel
 from megatron.core.transformer.experimental_attention_variant import dsa_layout
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer
 
-from megatron.core.transformer.experimental_attention_variant.dsa_sm90_native_fp8 import (
+from megatron.core.transformer.experimental_attention_variant.dsa_native_fp8_scorer import (
     install_dsa_sm90_fp8_scorer,
     validate_dsa_sm90_fp8_indexer,
 )
