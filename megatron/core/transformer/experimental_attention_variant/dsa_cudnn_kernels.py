@@ -532,8 +532,8 @@ def _fp8_ue8m0_quantize_last_dim(x: Tensor) -> Tuple[Tensor, Tensor]:
 def _fp8_roundtrip_last_dim(x: Tensor) -> Tensor:
     """Round ``x`` through E4M3 (UE8M0 per-vector scale) and back to FP32.
 
-    Used by the pure-torch global-row score path so that, under ``scoring_precision='fp8'``,
-    it incurs the same quantization as the dense cuDNN fp8 path and selects the same top-k.
+    This is a quantization reference for tests. Production FP8 scoring uses the native
+    cuDNN kernel because a torch matmul can have a different reduction order.
     """
     quantized, scale = _fp8_ue8m0_quantize_last_dim(x)
     return quantized.float() * scale.unsqueeze(-1)
@@ -558,19 +558,35 @@ def _indexer_forward(
       back to BF16 and call the stock cuDNN path unchanged.
     * ``"fp8"``: quantize the FP32 query/key to E4M3 with UE8M0 per-vector scales and call
       cuDNN with ``precision="fp8"`` plus ``q_scale``/``k_scale`` (natural descale).
-      ``weights`` stays BF16.
+      Q descale and score scale are folded into FP32 head weights.
     """
     if scoring_precision == "fp8":
         q_fp8, q_scale = _fp8_ue8m0_quantize_last_dim(index_q)
         k_fp8, k_scale = _fp8_ue8m0_quantize_last_dim(index_k)
+        # cuDNN SM90 treats FP32 weights as already scaled by Q descale and sm_scale.
+        folded_weights = (weights.float() * q_scale * sm_scale).contiguous()
+        if kwargs.get("q_causal_offsets") is None:
+            # CP segments use bottom-right alignment. SM90 otherwise defaults to offset 0.
+            if index_q.ndim == 4:
+                offsets = torch.full(
+                    (index_q.size(0),),
+                    index_k.size(1) * ratio - index_q.size(1),
+                    dtype=torch.int32,
+                    device=index_q.device,
+                )
+            else:
+                offsets = (
+                    torch.diff(kwargs["cu_seqlens_k"]) * ratio - torch.diff(kwargs["cu_seqlens_q"])
+                ).to(device=index_q.device, dtype=torch.int32)
+            kwargs["q_causal_offsets"] = offsets.contiguous()
         return _cudnn_dsa.indexer_forward_wrapper(
             q_fp8,
             k_fp8,
-            weights.to(torch.bfloat16),
+            folded_weights,
             ratio=ratio,
-            sm_scale=sm_scale,
+            sm_scale=1.0,
             precision="fp8",
-            q_scale=q_scale,
+            q_scale=torch.ones_like(q_scale),
             k_scale=k_scale,
             **kwargs,
         )
@@ -616,11 +632,63 @@ def _compute_indexer_scores_chunk_with_global_rows(
     b, sq, idx_nh, _idx_hd = q_chunk_bshd.shape
     sk = k_bshd.size(1)
     if scoring_precision == "fp8":
-        # Match the dense cuDNN fp8 path: round q/k through E4M3 before the FP32 accumulate.
-        # Ignore any precomputed (non-fp8) ``k_bdk`` and rebuild it from the rounded key.
-        q_chunk_bshd = _fp8_roundtrip_last_dim(q_chunk_bshd)
-        k_bshd = _fp8_roundtrip_last_dim(k_bshd)
-        k_bdk = None
+        # Use the native scorer: a dequantized torch matmul has a different reduction
+        # order and can select different keys near the top-k boundary.
+        if sq == 0:
+            return torch.empty((b, 0, sk), dtype=torch.float32, device=q_chunk_bshd.device)
+        if seq_lens is None:
+            offsets = torch.full((b,), row_start, dtype=torch.int32, device=q_chunk_bshd.device)
+            return _indexer_forward(
+                q_chunk_bshd,
+                k_bshd,
+                w_chunk_bsh,
+                ratio=indexer_ratio,
+                sm_scale=sm_scale,
+                scoring_precision="fp8",
+                q_causal_offsets=offsets,
+            )["scores"]
+        if seq_lens.ndim != 1 or seq_lens.numel() != sq:
+            raise RuntimeError(f"cuDNN DSA score chunk seq_lens must have shape ({sq},).")
+        seq_lens = seq_lens.to(device=q_chunk_bshd.device, dtype=torch.int64).clamp(max=sk)
+        local_rows = torch.arange(sq, device=q_chunk_bshd.device)
+        row_offsets = seq_lens * indexer_ratio - local_rows - 1
+        valid_rows = seq_lens > 0
+        # cuDNN accepts one offset per batch. Split where packed causal bounds reset.
+        boundaries = torch.nonzero(
+            (row_offsets[1:] != row_offsets[:-1]) | (valid_rows[1:] != valid_rows[:-1]),
+            as_tuple=False,
+        ).flatten()
+        boundaries = [0, *(boundaries + 1).cpu().tolist(), sq]
+        parts = []
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            offset = int(row_offsets[start].item()) + start
+            if offset < 0:
+                parts.append(
+                    torch.full(
+                        (b, end - start, sk),
+                        float("-inf"),
+                        dtype=torch.float32,
+                        device=q_chunk_bshd.device,
+                    )
+                )
+                continue
+            offsets = torch.full((b,), offset, dtype=torch.int32, device=q_chunk_bshd.device)
+            parts.append(
+                _indexer_forward(
+                    q_chunk_bshd[:, start:end].contiguous(),
+                    k_bshd,
+                    w_chunk_bsh[:, start:end].contiguous(),
+                    ratio=indexer_ratio,
+                    sm_scale=sm_scale,
+                    scoring_precision="fp8",
+                    q_causal_offsets=offsets,
+                )["scores"]
+            )
+        scores = torch.cat(parts, dim=1)
+        if key_positions is None:
+            key_positions = torch.arange(sk, device=q_chunk_bshd.device)
+        scores.masked_fill_(key_positions.view(1, 1, sk) >= seq_lens.view(1, sq, 1), float("-inf"))
+        return scores
     elif scoring_precision == "bf16":
         # Match the dense _indexer_forward BF16 contract: round FP32 carriers (produced by
         # dsa_indexer_rope_fp32) down to BF16 before the FP32 accumulate, so dense and
