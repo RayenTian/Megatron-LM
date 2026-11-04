@@ -2314,6 +2314,12 @@ class DSAIndexer(MegatronModule):
             cp_group=self.pg_collection.cp,
             # This flag is for the MLA-style interleaving in RoPE.
             mla_rotary_interleaved=self.config.dsa_indexer_rope_interleaved,
+            # Native FP8 reductions are sensitive to operand order near top-k ties.
+            # Restore adjacent RoPE pairs instead of exposing the internal even/odd grouping.
+            mla_output_remove_interleaving=(
+                self.config.dsa_indexer_scoring_precision == "fp8"
+                and self.config.dsa_indexer_rope_interleaved
+            ),
         )
         if squeezed_batch_dim:
             x_pe = x_pe.unsqueeze(1)
@@ -2421,6 +2427,10 @@ class DSAIndexer(MegatronModule):
         # =========================================
         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
         weights = self._project_indexer_weights(x)
+        if self.config.dsa_indexer_scoring_precision == "fp8":
+            # Preserve the projected values before score normalization; BF16 rounding here
+            # changes the discrete top-k selection even when Q/K quantization matches.
+            weights = weights.float()
         weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
 
         # Save token-aligned compression scores for the subsequent pool selection.

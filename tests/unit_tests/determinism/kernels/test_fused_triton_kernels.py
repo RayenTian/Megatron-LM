@@ -175,7 +175,7 @@ def test_dsa_indexer_scoring_replays():
                 sm_scale=kern._INDEXER_SOFTMAX_SCALE,
                 scoring_precision=p,
             )["scores"],
-            (q.float(), k.float(), w),
+            (q.float(), k.float(), w.float() * (h**-0.5) * (d**-0.5)),
             replays=3,
             backward=False,
             contention=True,
